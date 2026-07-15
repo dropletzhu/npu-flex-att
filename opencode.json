@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": {
+    "paths": [
+      "/data0/ascend_skills/awesome-ascend-skills/skills/ops/triton-ascend-migration",
+      "/data0/ascend_skills/cannbot-skills/ops/triton-op-coding",
+      "/data0/ascend_skills/cannbot-skills/ops/triton-latency-optimizer",
+      "/data0/ascend_skills/cannbot-skills/ops/triton-op-designer",
+      "/data0/ascend_skills/cannbot-skills/ops/triton-op-verifier",
+      "/data0/ascend_skills/cannbot-skills/ops/triton-precision-debug"
+    ]
+  }
+}
