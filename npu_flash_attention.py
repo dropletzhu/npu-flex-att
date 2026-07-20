@@ -37,6 +37,8 @@ def flash_attn_fwd_kernel(
     SLIDING_WINDOW: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     ALIBI_SLOPE,
+    USE_SOFTCAP: tl.constexpr,
+    SOFTCAP_VAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -107,6 +109,10 @@ def flash_attn_fwd_kernel(
 
         qk = tl.dot(q, k_t) * SM_SCALE
 
+        # [L2+] Tanh soft-capping (Gemma2/Grok-1): caps logits magnitude
+        if USE_SOFTCAP:
+            qk = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+
         if USE_ALIBI:
             qk = qk + tl.load(ALIBI_SLOPE + off_hq) * (offs_m[:, None] - offs_n[None, :])
 
@@ -129,6 +135,10 @@ def flash_attn_fwd_kernel(
         k_t = tl.trans(k)
 
         qk = tl.dot(q, k_t) * SM_SCALE
+
+        # [L2+] Tanh soft-capping (Gemma2/Grok-1): caps logits magnitude
+        if USE_SOFTCAP:
+            qk = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
 
         if USE_ALIBI:
             qk = qk + tl.load(ALIBI_SLOPE + off_hq) * (offs_m[:, None] - offs_n[None, :])
@@ -304,6 +314,8 @@ def flash_attn_bwd_dq_kernel(
     SM_SCALE,
     IS_CAUSAL: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    SOFTCAP_VAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -359,12 +371,18 @@ def flash_attn_bwd_dq_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
-        if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
-        if SLIDING_WINDOW > 0:
-            qk = tl.where((offs_m[:, None] - offs_n[None, :]) <= SLIDING_WINDOW, qk, float("-inf"))
+        # [L2+] Apply soft-cap for p recomputation (must match forward)
+        if USE_SOFTCAP:
+            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+        else:
+            qk_capped = qk
 
-        p = tl.math.exp2((qk - lse[:, None]) * RCP_LN2)
+        if IS_CAUSAL:
+            qk_capped = tl.where(offs_m[:, None] >= offs_n[None, :], qk_capped, float("-inf"))
+        if SLIDING_WINDOW > 0:
+            qk_capped = tl.where((offs_m[:, None] - offs_n[None, :]) <= SLIDING_WINDOW, qk_capped, float("-inf"))
+
+        p = tl.math.exp2((qk_capped - lse[:, None]) * RCP_LN2)
 
         dp = tl.dot(do.to(v.dtype), tl.trans(v))
 
@@ -372,6 +390,10 @@ def flash_attn_bwd_dq_kernel(
         dp_f32 = dp.to(tl.float32)
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
+
+        # [L2+] Chain through tanh soft-cap: d/dx[tanh(x/cap)*cap] = 1 - tanh^2(x/cap)
+        if USE_SOFTCAP:
+            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
 
         dq = tl.dot(ds.to(q.dtype), tl.trans(kt), dq)
 
@@ -395,6 +417,8 @@ def flash_attn_bwd_dkdv_kernel(
     SM_SCALE,
     IS_CAUSAL: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    SOFTCAP_VAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -458,12 +482,18 @@ def flash_attn_bwd_dkdv_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
-        if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
-        if SLIDING_WINDOW > 0:
-            qk = tl.where((offs_m[:, None] - offs_n[None, :]) <= SLIDING_WINDOW, qk, float("-inf"))
+        # [L2+] Apply soft-cap for p recomputation (must match forward)
+        if USE_SOFTCAP:
+            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+        else:
+            qk_capped = qk
 
-        p = tl.math.exp2((qk - lse[:, None]) * RCP_LN2)
+        if IS_CAUSAL:
+            qk_capped = tl.where(offs_m[:, None] >= offs_n[None, :], qk_capped, float("-inf"))
+        if SLIDING_WINDOW > 0:
+            qk_capped = tl.where((offs_m[:, None] - offs_n[None, :]) <= SLIDING_WINDOW, qk_capped, float("-inf"))
+
+        p = tl.math.exp2((qk_capped - lse[:, None]) * RCP_LN2)
 
         do_v = do.to(v.dtype)
         dp = tl.dot(do_v, vt)
@@ -472,6 +502,10 @@ def flash_attn_bwd_dkdv_kernel(
         dp_f32 = dp.to(tl.float32)
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
+
+        # [L2+] Chain through tanh soft-cap
+        if USE_SOFTCAP:
+            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
 
         dk = dk + tl.dot(tl.trans(ds.to(k.dtype)), q.to(k.dtype))
 
@@ -491,7 +525,13 @@ def flash_attn_bwd_dkdv_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
-        p = tl.math.exp2((qk - lse[:, None]) * RCP_LN2)
+        # [L2+] Apply soft-cap for p recomputation
+        if USE_SOFTCAP:
+            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+        else:
+            qk_capped = qk
+
+        p = tl.math.exp2((qk_capped - lse[:, None]) * RCP_LN2)
 
         do_v = do.to(v.dtype)
         dp = tl.dot(do_v, vt)
@@ -500,6 +540,10 @@ def flash_attn_bwd_dkdv_kernel(
         dp_f32 = dp.to(tl.float32)
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
+
+        # [L2+] Chain through tanh soft-cap
+        if USE_SOFTCAP:
+            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
 
         dk = dk + tl.dot(tl.trans(ds.to(k.dtype)), q.to(k.dtype))
 
@@ -561,6 +605,7 @@ def npu_flash_attention_forward(
     block_m=16,
     block_n=64,
     return_lse=False,
+    soft_cap=0.0,
 ):
     B, Hq, Sq, D = query.shape
     Bk, Hkv, Sk, Dk = key.shape
@@ -596,6 +641,8 @@ def npu_flash_attention_forward(
         SLIDING_WINDOW=sliding_window,
         USE_ALIBI=alibi_slope is not None,
         ALIBI_SLOPE=alibi_slope if alibi_slope is not None else query,
+        USE_SOFTCAP=soft_cap > 0.0,
+        SOFTCAP_VAL=soft_cap if soft_cap > 0.0 else 1.0,
         BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=D,
         multibuffer=True,  # [P5] enable double-buffering to hide K/V load latency
     )
@@ -613,6 +660,7 @@ def npu_flash_attention_backward(
     scale=None,
     block_m=16,
     block_n=32,
+    soft_cap=0.0,
 ):
     B, Hq, Sq, D = query.shape
     Bk, Hkv, Sk, Dk = key.shape
@@ -638,6 +686,9 @@ def npu_flash_attention_backward(
         key_exp = key
         value_exp = value
 
+    use_softcap = soft_cap > 0.0
+    softcap_val = soft_cap if soft_cap > 0.0 else 1.0
+
     grid_dq = (triton.cdiv(Sq, block_m), B, Hq)
     flash_attn_bwd_dq_kernel[grid_dq](
         query, key_exp, value_exp, lse, delta, grad_out, DQ,
@@ -650,6 +701,8 @@ def npu_flash_attention_backward(
         Sq, Sk, scale,
         IS_CAUSAL=causal,
         SLIDING_WINDOW=sliding_window,
+        USE_SOFTCAP=use_softcap,
+        SOFTCAP_VAL=softcap_val,
         BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=D,
         multibuffer=True,  # [P5] double-buffer to hide load latency
     )
@@ -667,6 +720,8 @@ def npu_flash_attention_backward(
         Sq, Sk, scale,
         IS_CAUSAL=causal,
         SLIDING_WINDOW=sliding_window,
+        USE_SOFTCAP=use_softcap,
+        SOFTCAP_VAL=softcap_val,
         BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=D,
         multibuffer=True,  # [P5] double-buffer to hide load latency
     )
@@ -681,13 +736,14 @@ def npu_flash_attention_backward(
 class NPUFlexAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, causal=False, sliding_window=0,
-                alibi_slope=None, scale=None, block_m=16, block_n=64):
+                alibi_slope=None, scale=None, block_m=16, block_n=64, soft_cap=0.0):
         ctx.causal = causal
         ctx.sliding_window = sliding_window
         ctx.alibi_slope = alibi_slope
         ctx.scale = scale
         ctx.block_m = block_m
         ctx.block_n = block_n
+        ctx.soft_cap = soft_cap
 
         with torch.no_grad():
             out, lse = npu_flash_attention_forward(
@@ -695,6 +751,7 @@ class NPUFlexAttention(torch.autograd.Function):
                 causal=causal, sliding_window=sliding_window,
                 alibi_slope=alibi_slope, scale=scale,
                 block_m=block_m, block_n=block_n, return_lse=True,
+                soft_cap=soft_cap,
             )
         ctx.save_for_backward(query, key, value, lse, out)
         return out
@@ -712,8 +769,9 @@ class NPUFlexAttention(torch.autograd.Function):
             causal=ctx.causal, sliding_window=ctx.sliding_window,
             alibi_slope=ctx.alibi_slope, scale=ctx.scale,
             block_m=ctx.block_m, block_n=bwd_block_n,
+            soft_cap=ctx.soft_cap,
         )
-        return DQ, DK, DV, None, None, None, None, None, None
+        return DQ, DK, DV, None, None, None, None, None, None, None
 
 
 def npu_flex_attention(
@@ -721,8 +779,101 @@ def npu_flex_attention(
     causal=False, sliding_window=0,
     alibi_slope=None, scale=None,
     block_m=16, block_n=64,
+    soft_cap=0.0,
 ):
     return NPUFlexAttention.apply(
         query, key, value, causal, sliding_window,
-        alibi_slope, scale, block_m, block_n,
+        alibi_slope, scale, block_m, block_n, soft_cap,
+    )
+
+
+# ================ L2+ Template Specialization Framework ================
+#
+# Unlike PyTorch FlexAttention (L3: arbitrary user score_mod/mask_mod via Inductor
+# codegen — blocked by triton-ascend compiler), this framework provides a
+# COMPOSABLE PREDEFINED PRIMITIVE library. Users compose patterns via config;
+# the dispatch layer maps config to Triton constexpr flags, producing a
+# specialized compiled kernel per unique combination (Triton auto-caches).
+#
+# Currently supported patterns:
+#   - Full attention (no mask)
+#   - Causal mask
+#   - Sliding window (+ causal)
+#   - ALiBi bias
+#   - GQA (arbitrary ratio)
+#   - Custom scale
+#   - Tanh soft-capping (Gemma2/Grok-1)  [NEW]
+#
+# All masking uses tl.where (not scf.if); all loop bounds are kernel parameters
+# (not tl.load values) — fully CANN/triton-ascend compatible.
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class AttentionConfig:
+    """Composable attention pattern configuration for the L2+ framework.
+
+    Example — Gemma2-style attention:
+        config = AttentionConfig(causal=True, sliding_window=1024, soft_cap=50.0)
+        out = flex_attention(q, k, v, config=config)
+
+    Example — ALiBi + causal:
+        config = AttentionConfig(causal=True, alibi_slope=slopes)
+        out = flex_attention(q, k, v, config=config)
+    """
+    causal: bool = False
+    sliding_window: int = 0
+    alibi_slope: Optional[torch.Tensor] = None
+    scale: Optional[float] = None
+    soft_cap: float = 0.0
+    block_m: int = 16
+    block_n: int = 64
+
+    def __post_init__(self):
+        if self.sliding_window < 0:
+            raise ValueError("sliding_window must be >= 0")
+        if self.soft_cap < 0:
+            raise ValueError("soft_cap must be >= 0")
+
+
+def flex_attention(query, key, value, config: Optional[AttentionConfig] = None, **kwargs):
+    """NPU FlexAttention (L2+ template specialization framework).
+
+    Dispatches to specialized Triton-Ascend kernels based on config. Each unique
+    combination of patterns maps to constexpr flags, producing a compiled kernel
+    that Triton auto-caches (no recompilation for same config).
+
+    Args:
+        query, key, value: [B, H, S, D] tensors (fp16/fp32/bf16)
+        config: AttentionConfig specifying attention patterns to compose.
+                 If None, uses kwargs to build a default config.
+        **kwargs: Direct pattern arguments (causal=, sliding_window=, alibi_slope=,
+                  soft_cap=, scale=, block_m=, block_n=). Ignored if config is given.
+
+    Returns:
+        Output tensor [B, H, S, D] (same dtype as input).
+
+    Examples:
+        # Causal only
+        out = flex_attention(q, k, v, causal=True)
+
+        # Gemma2: causal + sliding window + soft-capping
+        out = flex_attention(q, k, v, causal=True, sliding_window=1024, soft_cap=50.0)
+
+        # Via config object
+        cfg = AttentionConfig(causal=True, sliding_window=512, soft_cap=20.0)
+        out = flex_attention(q, k, v, config=cfg)
+    """
+    if config is None:
+        config = AttentionConfig(**kwargs)
+    return npu_flex_attention(
+        query, key, value,
+        causal=config.causal,
+        sliding_window=config.sliding_window,
+        alibi_slope=config.alibi_slope,
+        scale=config.scale,
+        block_m=config.block_m,
+        block_n=config.block_n,
+        soft_cap=config.soft_cap,
     )
