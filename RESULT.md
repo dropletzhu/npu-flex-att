@@ -12,7 +12,7 @@
 | Block Size | 前向: BLOCK_M=16, BLOCK_N=64; 反向: BLOCK_M=16, BLOCK_N=32/64 (按 Sk 动态) |
 | 编译选项 | `multibuffer=True` (三个 kernel 均启用双缓冲) |
 
-> **本结果对应优化版本** (P0 因果跳过 + P1 转置外提 + P3 缓存 + P4 mask 分裂 + 全局 Delta 修复 + multibuffer)。
+> **本结果对应优化版本** (P0 因果跳过 + P1 转置外提 + P3 缓存 + P4 mask 分裂 + 全局 Delta 修复 + multibuffer + L2+ 模板特化框架)。
 > 各优化项的实测收益见 §七「性能分析」。
 
 ## 一、正确性测试结果
@@ -228,6 +228,28 @@
 > **前向与反向精度均优秀**。全局 Delta 修复后，反向 dQ/dK 从修复前的 0.15-0.30 (旧实现按块局部
 > row_sum 近似) 降至 **fp32 ~1e-7 / fp16 ~2e-4 / bf16 ~2e-3**，与参考实现精确匹配，训练完全可用。
 
+## 6.5、L2+ 模板特化框架 — Tanh Soft-Capping 测试
+
+### 框架 API 验证
+
+| 测试 | 结果 |
+|------|------|
+| `AttentionConfig` vs kwargs 一致性 | bit 一致 (0.0) |
+| Autograd 端到端前向 (fp16, soft_cap=50) | err=7.72e-04 ✓ |
+| Autograd 端到端反向 dQ (fp16, soft_cap=50) | err=0.0010 ✓ |
+
+### Soft-Capping 精度
+
+| 模式 | dtype | soft_cap | 前向 err | 反向 dQ | 反向 dK | 结果 |
+|------|-------|----------|---------|---------|---------|------|
+| Causal | fp32 | 50.0 | 1.61e-06 | 0.0000 | 0.0000 | PASS |
+| Causal | fp16 | 50.0 | 1.00e-03 | 0.0020 | 0.0020 | PASS |
+| Causal | fp16 | 0.0 (无) | 9.92e-04 | — | — | PASS (回归) |
+
+> **结论**: Tanh soft-capping 前向+反向均正确。fp32 达机器精度 (1.6e-6),fp16 在精度容差内。
+> 反向的 tanh 导数链式法则 (`ds *= 1-tanh²(qk/cap)`) 验证正确 (fp32 dQ=0.0000)。
+> 无 soft_cap (cap=0) 时与原 kernel 行为一致,无回归。
+
 ## 七、性能分析
 
 ### 优化后优势场景
@@ -235,7 +257,8 @@
 - **小序列 (S≤128)**: 前向达到或超过 SDPA 速度 (1.24x @ S=128)
 - **因果注意力**: P0 因果块跳过 + P4 mask 分裂使前向/反向大幅加速（S=2048 前向 4.34x、反向 2.52x vs 优化前）
 - **训练精度**: 全局 Delta 修复使反向梯度达机器精度，适合训练
-- **自定义掩码**: 支持 sliding window / GQA 等模式，原生 SDPA 不直接支持全部组合
+- **L2+ 模板特化框架**: 支持 causal/sliding/ALiBi/GQA/soft-cap 等模式任意组合,覆盖 Gemma2/Mistral/T5 等模型注意力变体
+- **自定义掩码**: 支持 sliding window / GQA / ALiBi / soft-capping 等模式组合
 
 ### 与 SDPA 剩余差距原因 (中大序列 0.54-0.66x)
 
@@ -255,3 +278,4 @@
 | P3 缓存 do_v | DKDV 复用 `do.to(v.dtype)` | 反向微增 |
 | multibuffer | 三 kernel 双缓冲隐藏访存延迟 | 前向小序列 ~1.45x |
 | 动态反向 BLOCK_N | `32 if Sk≤512 else 64` | 大 S 反向 ~9% |
+| **L2+ 框架** | **`AttentionConfig` + constexpr 特化 dispatch** | **新增 tanh soft-capping (Gemma2/Grok-1)** |

@@ -97,6 +97,8 @@ Grid: (cdiv(S, BLOCK_M), B, H)
 每段循环体:
     1. 加载 K[n:n+BLOCK_N, :] 和 V[n:n+BLOCK_N, :]  (multibuffer 双缓冲隐藏延迟)
     2. qk = Q @ K^T * scale                          (tl.dot)
+    2b. [L2+] if USE_SOFTCAP: qk = tanh(qk/cap) * cap (Gemma2/Grok-1 软截断)
+    2c. [if USE_ALIBI] qk += alibi_slope[h] * (q_idx - kv_idx)
     3. [仅后缀] 应用 mask (causal / sliding window)   (tl.where)
     4. m_ij = max(m_i, max(qk))                      (在线 max)
     5. alpha = exp(m_i - m_ij)                       (缩放因子)
@@ -260,6 +262,7 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 | P4 因果 mask 分裂 | 前向+DKDV | 对角线以下块免 `tl.where` | 前向大 S 额外 ~2x |
 | multibuffer | 三 kernel | 双缓冲隐藏 MTE2 访存延迟 | 前向小 S ~1.45x |
 | 动态反向 BLOCK_N | 反向 | `32 if Sk≤512 else 64` | 大 S 反向 ~9% |
+| **L2+ 模板特化框架** | 全部 | `AttentionConfig` + constexpr dispatch | 新增 soft-cap (Gemma2),可组合原语库 |
 
 **综合结果**: 前向 1.47x-4.34x、反向 1.20x-2.52x (vs 优化前 v2)，前向 vs SDPA 由 0.12-0.31x 提升至
 0.54-0.66x，S=128 前向超过 SDPA。
@@ -275,19 +278,92 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 | 特性 | 前向 | 反向 | 备注 |
 |------|------|------|------|
 | Full Attention (无 mask) | ✅ | ✅ | |
-| Causal Mask | ✅ | ✅ | |
+| Causal Mask | ✅ | ✅ | 下三角因果掩码 |
 | Sliding Window | ✅ | ✅ | 与 causal 组合使用 |
 | GQA (任意 ratio) | ✅ | ✅ | 通过 Python 层 expand + sum |
+| ALiBi Bias | ✅ | ✅ | 注意力分数线性偏置,per-head slope |
+| Tanh Soft-Capping | ✅ | ✅ | Gemma2/Grok-1 风格 logits 软截断 |
 | 自定义 Scale | ✅ | ✅ | |
 | LSE 输出 | ✅ | — | 用于反向传播 |
-| fp32 | ✅ | ✅ | |
-| fp16 | ✅ | ✅ | |
-| bf16 | ✅ | ✅ | |
+| fp32 / fp16 / bf16 | ✅ | ✅ | |
 | 任意 head_dim | ✅ | ✅ | D=32/64/128 已验证 |
+| **模式任意组合** | ✅ | ✅ | L2+ 框架: 多模式可同时启用 |
+
+## 3.5 L2+ 模板特化框架
+
+### 动机
+
+PyTorch FlexAttention (L3) 通过 Inductor 追踪**任意**用户 `score_mod`/`mask_mod` 函数生成 Triton kernel。这在 Ascend NPU 上被 bishengir-compile 阻断 (§1.2)。
+
+L2+ 框架采用**折中方案**:提供**可组合的预定义原语库**,用户通过 `AttentionConfig` 组合模式,框架映射到 Triton `tl.constexpr` flags,编译期特化生成专用 kernel。每个唯一 flag 组合 = 1 个特化编译 kernel (Triton 自动缓存,相同 config 不重编译)。
+
+### API
+
+```python
+from npu_flash_attention import flex_attention, AttentionConfig
+
+cfg = AttentionConfig(causal=True, sliding_window=1024, soft_cap=50.0, alibi_slope=slopes)
+out = flex_attention(q, k, v, config=cfg)
+# 或: flex_attention(q, k, v, causal=True, sliding_window=1024, soft_cap=50.0)
+```
+
+### Dispatch 机制
+
+```
+AttentionConfig → host 预处理(alibi_bias/delta) → Triton kernel[constexpr flags]
+                                                      ↓
+                                        编译期特化(每唯一组合 1 个 kernel)
+```
+
+### 原语库
+
+| 模式 | Kernel constexpr flag | 实现机制 | CANN 兼容 |
+|------|----------------------|---------|-----------|
+| Full attention | (无 flag) | 无掩码 | ✅ |
+| Causal | `IS_CAUSAL` | `tl.where` 掩码 | ✅ |
+| Sliding window | `SLIDING_WINDOW` | `tl.where` 掩码 | ✅ |
+| ALiBi | `USE_ALIBI` | 分数偏置 `score += slope*(q-k)` | ✅ |
+| GQA | `GQA_GROUPS` | head 映射 `off_hkv = off_hq // groups` | ✅ |
+| Tanh soft-cap | `USE_SOFTCAP` + `SOFTCAP_VAL` | `qk = tanh(qk/cap)*cap` | ✅ |
+| Custom scale | `SM_SCALE` | 标量乘法 | ✅ |
+
+### CANN 兼容约束
+
+- 掩码用 `tl.where`(非 `scf.if`) — 规避循环内条件分支限制
+- 循环上界用 kernel 参数(非 `tl.load` 值) — 规避块稀疏限制
+- 简单指针运算 `tl.load(ptr + offsets)` — 规避 `memref.reinterpret_cast` 限制
+
+### Tanh Soft-Capping 实现 (Gemma2/Grok-1)
+
+**前向**: 在 `qk = Q@K^T * scale` 之后、掩码之前施加:
+```
+qk_capped = tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+```
+
+**反向**: 重计算 soft-cap 用于 `p` 恢复,并在 `ds` 乘 tanh 导数:
+```
+# 重计算 p (匹配前向)
+qk_capped = tanh(qk / cap) * cap
+p = exp2((qk_capped - lse) * RCP_LN2)
+
+# softmax 反向 + tanh 链式法则
+ds = p * (dp - Delta) * SM_SCALE
+ds *= (1 - tanh^2(qk / cap))  # tanh 导数
+```
+
+### 可扩展性
+
+添加新模式遵循统一模式:
+1. kernel 签名加 `tl.constexpr` flag
+2. kernel 体加条件逻辑 (`if FLAG: ...`)
+3. host 函数加参数
+4. `AttentionConfig` 加字段
+
+**未来候选模式**: Relative Position Encoding、PrefixLM、Document Masking。
 
 ## 4. 已知限制
 
-1. **不支持任意 score_mod/mask_mod**：仅支持预定义的 causal、sliding window、alibi 模式，不支持 PyTorch FlexAttention 的任意用户函数追踪
+1. **不支持任意 score_mod/mask_mod**：仅支持预定义原语 (causal、sliding window、ALiBi、GQA、tanh soft-capping 等) 的可组合特化，不支持 PyTorch FlexAttention 的任意用户函数追踪
 2. **大序列性能为 SDPA 的 0.54-0.66x**：原生 SDPA 使用 CANN 硬件级优化内核 (软件流水、TMA 等)，本实现受 triton-ascend 编译器限制无法企及
 3. **DQ 反向 kernel 无法应用 P4 mask 分裂**：triton-ascend 编译器对 DQ 的双循环形式误编译 (产生错误 dQ)，前向/DKDV 同结构正常；DQ 保持单循环
 4. **不支持 block-sparse BlockMask**：不支持 PyTorch FlexAttention 的块稀疏索引格式

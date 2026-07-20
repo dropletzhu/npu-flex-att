@@ -1,6 +1,8 @@
-# NPU Flash Attention
+# NPU Flex Attention
 
-在 Ascend NPU 上基于 Triton-Ascend 实现的 Flash Attention 内核，支持前向传播与反向传播，适用于因果掩码、滑动窗口、GQA 等常见注意力模式。
+在 Ascend NPU 上基于 Triton-Ascend 实现的 Flash Attention 内核与 **L2+ 模板特化框架**，支持前向传播与反向传播。通过可组合的预定义原语库（causal、sliding window、ALiBi、GQA、tanh soft-capping 等）覆盖主流注意力模式，适用于 LLM 训练与推理。
+
+> **与 PyTorch FlexAttention 的关系**: FlexAttention (L3) 依赖 Inductor 追踪任意用户函数,被 triton-ascend 编译器阻断。本项目采用 **L2+ 模板特化框架**——预定义可组合原语 + constexpr 特化 dispatch,绕过编译器限制,覆盖 90%+ 实际注意力模式需求。详见 [DESIGN.md](DESIGN.md) §2.7。
 
 ## 快速开始
 
@@ -70,11 +72,38 @@ out = npu_flash_attention_forward(q, k, v, causal=True, sliding_window=64)
 out = npu_flash_attention_forward(q, k, v, scale=0.05)
 ```
 
+### L2+ 框架 API (推荐)
+
+使用 `flex_attention` + `AttentionConfig` 组合多种注意力模式:
+
+```python
+from npu_flash_attention import flex_attention, AttentionConfig
+
+# Gemma2 风格: causal + sliding window + tanh soft-capping
+cfg = AttentionConfig(causal=True, sliding_window=1024, soft_cap=50.0)
+out = flex_attention(q, k, v, config=cfg)
+
+# 或直接传 kwargs
+out = flex_attention(q, k, v, causal=True, sliding_window=1024, soft_cap=50.0)
+
+# autograd 端到端 (前向+反向自动支持)
+q.requires_grad_(True); k.requires_grad_(True); v.requires_grad_(True)
+out = flex_attention(q, k, v, causal=True, soft_cap=50.0)
+out.backward(grad_out)
+```
+
+### Tanh Soft-Capping (Gemma2 / Grok-1)
+
+```python
+# 对 attention logits 施加 tanh 软截断,防止 logits 过大
+out = npu_flash_attention_forward(q, k, v, causal=True, soft_cap=50.0)
+```
+
 ## 项目结构
 
 ```
 flex-attn/
-├── npu_flash_attention.py   # 核心实现: 前向+反向 Triton kernel + Python API
+├── npu_flash_attention.py   # 核心实现: 前向+反向 Triton kernel + L2+ 框架 API
 ├── setup_env.sh             # bishengir-compile PATH 配置
 ├── opencode.json             # opencode skills 配置
 ├── DESIGN.md                 # 设计文档
@@ -83,15 +112,11 @@ flex-attn/
 ├── README.md                 # 本文件
 └── test/                     # 测试脚本目录
     ├── test_comprehensive.py # 全面测试套件 (38 项)
-    ├── test_api_compat.py    # Triton API 兼容性验证
-    ├── test_minimal_flash_attn.py   # 最小 Flash Attention 验证
-    ├── test_grad_correctness.py     # 梯度正确性验证
-    ├── test_npu_flash_attn.py       # 前向+反向功能测试
-    ├── test_bf16_full.py       # bf16 全量测试 (38 项)
-    ├── test_real_world.py      # 真实场景测试 (12 项)
-    ├── bench_flash_attn.py          # 性能基准测试
-    ├── bench_block_sweep.py         # Block size 扫描
-    └── ...                         # 其他调试/隔离测试脚本
+    ├── test_bf16_full.py     # bf16 全量测试 (38 项)
+    ├── test_real_world.py    # 真实场景测试 (12 项)
+    ├── test_supplementary.py # 补充测试 (13 项)
+    ├── bench_flash_attn.py   # 性能基准测试
+    └── ...
 ```
 
 ## 支持的特性
@@ -102,9 +127,12 @@ flex-attn/
 | Causal Mask | ✅ | ✅ | 因果掩码 (下三角) |
 | Sliding Window | ✅ | ✅ | 滑动窗口掩码 |
 | GQA (任意 ratio) | ✅ | ✅ | Grouped Query Attention |
+| ALiBi Bias | ✅ | ✅ | 注意力分数线性偏置 |
+| Tanh Soft-Capping | ✅ | ✅ | Gemma2/Grok-1 风格 logits 软截断 |
 | 自定义 Scale | ✅ | ✅ | |
 | LSE 输出 | ✅ | — | 用于反向传播 |
 | fp32 / fp16 / bf16 | ✅ | ✅ | |
+| **模式任意组合** | ✅ | ✅ | L2+ 框架: causal+sliding+alibi+softcap 等可同时启用 |
 
 ## 设计要点
 
@@ -140,7 +168,7 @@ flex-attn/
 # 环境配置
 source setup_env.sh
 
-# 全面测试 (38 项, 约 5-10 分钟)
+# 全面测试 (38 项)
 python test/test_comprehensive.py
 
 # bf16 全量测试 (38 项)
@@ -149,16 +177,16 @@ python test/test_bf16_full.py
 # 真实场景测试 (12 项)
 python test/test_real_world.py
 
+# 补充测试 (13 项)
+python test/test_supplementary.py
+
 # 性能 benchmark
 python test/bench_flash_attn.py
-
-# API 兼容性
-python test/test_api_compat.py
 ```
 
 ## 已知限制
 
-1. 不支持 PyTorch FlexAttention 的任意 `score_mod` / `mask_mod` 函数追踪 — 仅支持预定义的 causal、sliding window 模式
+1. 不支持 PyTorch FlexAttention 的任意 `score_mod` / `mask_mod` 函数追踪 — 仅支持预定义原语 (causal、sliding window、ALiBi、GQA、tanh soft-capping 等) 的可组合特化
 2. 大序列性能为 SDPA 的 0.54-0.66x — 原生 SDPA 使用 CANN `npu_fusion_attention` 硬件级内核 (软件流水、TMA 等本实现无法企及)
 3. 前向 DQ 反向 kernel 无法应用 P4 mask 分裂 — triton-ascend 编译器对 DQ 双循环形式误编译 (前向/DKDV 同结构正常)，DQ 保持单循环
 4. 不支持 block-sparse BlockMask — 不支持 PyTorch FlexAttention 的块稀疏索引格式
@@ -169,7 +197,9 @@ python test/test_api_compat.py
 
 ## 适用场景
 
-- 需要自定义掩码组合 (causal + sliding window) 的注意力计算
+- Gemma2 / Grok-1 等使用 tanh soft-capping 的模型注意力
+- Mistral 等使用 sliding window + causal 的模型
+- 需要自定义掩码组合 (causal + sliding window + ALiBi + soft-cap) 的注意力计算
 - 需要 LSE 输出用于自定义反向传播或 KV cache 场景
 - 需要 bf16/fp16 混合精度训练的前向 + 反向
 - 研究 Triton-Ascend 在 NPU 上的 kernel 开发
@@ -177,7 +207,7 @@ python test/test_api_compat.py
 
 ## 不适用场景
 
-- 需要任意 score_mod (如 ALiBi、相对位置编码等动态修改) 的场景 — 需等待 triton-ascend 修复编译器限制后通过 Inductor 路径实现
+- 需要**任意** `score_mod`/`mask_mod` (超出预定义原语库的自定义函数) — 需等待 triton-ascend 修复编译器限制后通过 Inductor 路径实现
 - 需要极致性能的大规模推理 — 建议使用 `npu_fusion_attention` 原生算子
 - 需要 block-sparse 掩码 (如文档级掩码、自定义稀疏模式) — 当前不支持 BlockMask
 - 需要与 `torch.compile` 无缝集成的场景 — 直接调用方式不支持 autograd tracing
