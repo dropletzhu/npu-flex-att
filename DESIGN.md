@@ -270,8 +270,6 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 - DQ kernel P4 分裂：编译器误编译 → 保持单循环
 - CANN 原生快速路径：会绕过 Triton 前向实现，改变项目本质 → 决定保持纯 Triton
 
-详细优化历程、实测数据与决策依据见 [OPTIMIZATION.md](OPTIMIZATION.md)。
-
 ## 3. 支持的特性
 
 | 特性 | 前向 | 反向 | 备注 |

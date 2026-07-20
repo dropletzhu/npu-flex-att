@@ -13,7 +13,7 @@
 | 编译选项 | `multibuffer=True` (三个 kernel 均启用双缓冲) |
 
 > **本结果对应优化版本** (P0 因果跳过 + P1 转置外提 + P3 缓存 + P4 mask 分裂 + 全局 Delta 修复 + multibuffer)。
-> 优化历程与逐项分析见 [OPTIMIZATION.md](OPTIMIZATION.md)。
+> 各优化项的实测收益见 §七「性能分析」。
 
 ## 一、正确性测试结果
 
@@ -51,7 +51,7 @@
 > **🔴 全局 Delta 修复后精度飞跃 (~10^5x)**：dQ/dK fp32 达 **1e-7 级别**(机器精度)，fp16 达 **2.4e-4**。
 > 修复前旧实现用**按块局部** `row_sum` 近似 softmax 雅可比项，dQ/dK 误差高达 0.15-0.30
 > (S≥512 时甚至超过 0.2 阈值——实际精度失败)。改用全局 `Delta = rowsum(O⊙dO)` 恒等式后，
-> 反向梯度与参考实现精确匹配。详见 [OPTIMIZATION.md](OPTIMIZATION.md) §5.2。
+> 反向梯度与参考实现精确匹配。
 
 ### C. 数值稳定性 (6/6 PASS)
 
@@ -244,7 +244,7 @@
 3. **无 TMA/Warp Specialization**: Triton-Ascend 3.2.0rc4 不支持这些硬件特性
 4. **Vector-bound 本质**: profiling 显示前向 Cube 利用率仅 ~6%、Vector 占 80-90%，softmax 的 exp/rescale 是瓶颈
 
-### 已应用的优化 (详见 OPTIMIZATION.md)
+### 已应用的优化
 
 | 优化 | 内容 | 收益 |
 |------|------|------|

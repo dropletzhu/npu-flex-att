@@ -132,7 +132,7 @@ flex-attn/
 > S=128 前向超过 SDPA 原生内核速度。前向 vs SDPA 已从优化前的 0.12-0.31x 提升到 0.54-0.66x。
 > 大序列剩余差距来自 CANN `npu_fusion_attention` 的硬件级优化 (软件流水、Cube 直接调度等)。
 
-详细测试结果与优化历程见 [RESULT.md](RESULT.md) 与 [OPTIMIZATION.md](OPTIMIZATION.md)。
+详细测试结果与优化历程见 [RESULT.md](RESULT.md)。
 
 ## 运行测试
 
