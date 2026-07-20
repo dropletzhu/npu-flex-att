@@ -90,11 +90,14 @@ Grid: (cdiv(S, BLOCK_M), B, H)
   l_i = 0     (运行 exp 和)
   acc = 0     (输出累加器)
 
-循环 (遍历 KV 块):
-  for n in range(0, KV_LEN, BLOCK_N):
-    1. 加载 K[n:n+BLOCK_N, :] 和 V[n:n+BLOCK_N, :]  (预加载, 隐藏延迟)
+[P0] causal 上界: kv_end = min((pid_m+1)*BLOCK_M, KV_LEN)  (跳过对角线以上全 masked 块, 省 44-48% 迭代)
+[P4] mask 分裂: full_end = (pid_m*BLOCK_M // BLOCK_N)*BLOCK_N
+  ├─ 无 mask 前缀 (对角线以下, 免 tl.where):  for n in range(start_n, full_end, BLOCK_N)
+  └─ 带 mask 后缀 (对角线块):                  for n in range(full_end, kv_end, BLOCK_N)
+每段循环体:
+    1. 加载 K[n:n+BLOCK_N, :] 和 V[n:n+BLOCK_N, :]  (multibuffer 双缓冲隐藏延迟)
     2. qk = Q @ K^T * scale                          (tl.dot)
-    3. 应用 mask (causal / sliding window)            (tl.where)
+    3. [仅后缀] 应用 mask (causal / sliding window)   (tl.where)
     4. m_ij = max(m_i, max(qk))                      (在线 max)
     5. alpha = exp(m_i - m_ij)                       (缩放因子)
     6. p = exp(qk - m_ij)                            (注意力概率)
@@ -106,6 +109,9 @@ Grid: (cdiv(S, BLOCK_M), B, H)
   acc /= l_i                                        (归一化)
   LSE = m_i + ln(l_i)                               (logsumexp)
 ```
+
+> **P4 mask 分裂**在数学上完全等价 (`where(True, x, -inf) == x`, 实测输出 bit 一致)，
+> 但对角线以下的块免除了 `tl.where` Vector 选择，前向大序列因此额外获得 ~2x 加速。
 
 #### 关键设计决策
 
@@ -120,21 +126,33 @@ Grid: (cdiv(S, BLOCK_M), B, H)
 
 ### 2.3 反向 Kernel 设计
 
+#### 全局 Delta (softmax 雅可比) — 关键正确性设计
+
+softmax 反向的雅可比项需要**整行**的 `rowsum(p ⊙ dp)`。由于 flash attention 分块遍历 KV，
+早期实现用**按块局部** `tl.sum(p*dp, 1)` 近似，仅当单个 KV 块覆盖整行时才正确 → dQ/dK 误差 0.15-0.30。
+
+**正确方案**：利用恒等式 `rowsum(p ⊙ dp) = rowsum(O ⊙ dO) ≡ Delta`（O 为前向输出）。
+在 Host 侧一次性预计算 `Delta = (out.float() * grad_out.float()).sum(-1)`，传入两个反向 kernel，
+用 `ds = p * (dp - Delta[:, None]) * scale`。此举同时保证正确性（全局精确）并省去每块的 `tl.sum`。
+
 #### DQ Kernel
 
 ```
 Grid: (cdiv(S, BLOCK_M), B, H)
 每个 program 计算一个 query 块的 dQ
 
-循环 (遍历 KV 块):
-  for n in range(0, KV_LEN, BLOCK_N):
+[P0] causal 上界: kv_end = min((pid_m+1)*BLOCK_M, KV_LEN)  (跳过对角线以上全 masked 块)
+循环 (遍历 KV 块 0..kv_end):
+  for n in range(start_n, kv_end, BLOCK_N):
     1. 加载 K, V
     2. qk = Q @ K^T * scale
-    3. 应用 mask
+    3. 应用 mask (causal / sliding, tl.where)
     4. p = exp2((qk - LSE) * RCP_LN2)     (从存储的 LSE 恢复概率)
     5. dp = dO @ V^T                       (注意力概率的梯度)
-    6. ds = p * (dp - sum(p * dp)) * scale (softmax 反向 + 链式法则)
+    6. ds = p * (dp - Delta) * scale       (全局 Delta, 见上)
     7. dQ += ds @ K                        (Q 的梯度, tl.dot 累加)
+
+注: DQ kernel 无法应用 P4 mask 分裂 —— triton-ascend 编译器对其双循环形式误编译, 保持单循环。
 ```
 
 #### DK/DV Kernel
@@ -143,16 +161,20 @@ Grid: (cdiv(S, BLOCK_M), B, H)
 Grid: (cdiv(S, BLOCK_N), B, H)
 每个 program 计算一个 KV 块的 dK 和 dV
 
-循环 (遍历 Q 块):
-  for m in range(0, Q_LEN, BLOCK_M):
-    1. 加载 Q, dO, LSE
-    2. qk = Q @ K^T * scale
-    3. 应用 mask
+[P0] causal 下界: q_start = (pid_n*BLOCK_N // BLOCK_M) * BLOCK_M  (从对角线块开始)
+[P1] kt/vt = trans(k)/trans(v) 外提到循环前 (循环不变量)
+[P4] mask 分裂: 对角线带 (masked) + 对角线上方 (unmasked) 两段循环
+循环 (遍历 Q 块 q_start..Q_LEN):
+  for m in range(q_start, Q_LEN, BLOCK_M):
+    1. 加载 Q, dO, LSE, Delta
+    2. qk = Q @ kt * scale
+    3. 应用 mask (仅对角带; 上方段免 tl.where)
     4. p = exp2((qk - LSE) * RCP_LN2)
-    5. dp = dO @ V^T
-    6. dV += p^T @ dO                     (V 的梯度)
-    7. ds = p * (dp - sum(p * dp)) * scale (softmax 反向)
-    8. dK += ds^T @ Q                     (K 的梯度)
+    5. do_v = dO.to(v.dtype)              [P3] 缓存, dp 与 dv 复用
+    6. dp = do_v @ vt
+    7. dV += p^T @ do_v                   (V 的梯度)
+    8. ds = p * (dp - Delta) * scale      (全局 Delta)
+    9. dK += ds^T @ Q                     (K 的梯度)
 ```
 
 #### GQA 处理
@@ -186,7 +208,8 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 
 ### 2.5 Block Size 选择
 
-通过全面扫描 9 种 block size 组合确定最优配置：
+通过全面扫描 block size 组合确定最优配置（下表为**优化前基线**的前向延迟，用于**相对**比较选型；
+优化后绝对延迟已快约 2x，但相对排序不变）：
 
 | BLOCK_M | BLOCK_N | S=128 | S=512 | S=1024 | S=2048 |
 |---------|---------|-------|-------|--------|--------|
@@ -201,7 +224,17 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 - BLOCK_M=16: 增加 grid 块数, 提升小序列核心利用率
 - BLOCK_N=64: 减少循环次数, 更好的开销摊销
 
-反向使用 BLOCK_M=16, BLOCK_N=32 (更小 block 避免 UB 溢出)
+> 复测确认 (含 multibuffer): 16/64 在各序列长度均近最优 (7% 以内)。BLOCK_M=32 会让主力低 batch
+> 配置退化最多 24% —— 印证前向为 **Vector-bound 而非 Cube-bound** (增大 BLOCK_M 主帮 Cube)。
+
+**反向**使用 BLOCK_M=16, **BLOCK_N 动态** (`32 if Sk≤512 else 64`, autograd 路径)：
+实测短序列 BLOCK_N=32 快 20%、长序列 BLOCK_N=64 快 9%，交叉点约 S=1024。
+
+### 2.5b 编译选项: multibuffer
+
+三个 kernel 的 launch 均传入 `multibuffer=True` 启用**双缓冲**，隐藏 K/V 加载的 MTE2 访存延迟
+(前向为访存/Vector 密集型, MTE2-Cube 不重叠)。小序列 (S≤256) latency-bound，收益显著 (~1.45x)，
+使 S=128 前向超过 SDPA；大序列已计算饱和，收益中性。
 
 ### 2.6 NPU 硬件约束
 
@@ -212,6 +245,32 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 | Cube 单元 | 支持 tl.dot | fp16/fp32 GEMM |
 | Vector 单元 | 支持 exp2/load/store | 数学函数和访存 |
 | bishengir-compile | 3.2.0rc4 | 不支持 scf.if/memref.reinterpret_cast 在循环内 |
+
+### 2.7 优化演进总览
+
+在基础 Triton kernel (v2) 之上，按 profiling 结论 (Cube ~6%、Vector 80-90%、因果浪费 44-48% 循环)
+和 triton-latency-optimizer skill 系统化实施了以下优化：
+
+| 优化 | 作用对象 | 核心思想 | 实测收益 (vs v2) |
+|------|---------|---------|-----------------|
+| P0 因果块跳过 | 前向+DQ+DKDV | 对角线感知循环上/下界，跳过全 masked 块 | 大 S ~1.5-2x |
+| 🔴 全局 Delta 修复 | DQ+DKDV | `Delta=rowsum(O⊙dO)` 替代按块局部 row_sum | **精度 ~10^5x** + 省 Vector |
+| P1 转置外提 | DKDV | `kt/vt` 循环不变量外提 | 反向 ~1.1x |
+| P3 缓存 do_v | DKDV | 复用 `do.to(v.dtype)` | 反向微增 |
+| P4 因果 mask 分裂 | 前向+DKDV | 对角线以下块免 `tl.where` | 前向大 S 额外 ~2x |
+| multibuffer | 三 kernel | 双缓冲隐藏 MTE2 访存延迟 | 前向小 S ~1.45x |
+| 动态反向 BLOCK_N | 反向 | `32 if Sk≤512 else 64` | 大 S 反向 ~9% |
+
+**综合结果**: 前向 1.47x-4.34x、反向 1.20x-2.52x (vs 优化前 v2)，前向 vs SDPA 由 0.12-0.31x 提升至
+0.54-0.66x，S=128 前向超过 SDPA。
+
+**尝试后放弃的优化** (遵循实测驱动原则):
+- 前向 BLOCK_M=32：数据推翻理论，主力配置退化最多 24% → 保持 16/64
+- i32→float 比较 (避免标量降级)：`.to(float32)` 转换开销 > 收益，大序列回退 36-50% → 弃用
+- DQ kernel P4 分裂：编译器误编译 → 保持单循环
+- CANN 原生快速路径：会绕过 Triton 前向实现，改变项目本质 → 决定保持纯 Triton
+
+详细优化历程、实测数据与决策依据见 [OPTIMIZATION.md](OPTIMIZATION.md)。
 
 ## 3. 支持的特性
 
@@ -230,12 +289,16 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 
 ## 4. 已知限制
 
-1. **不支持任意 score_mod/mask_mod**：仅支持预定义的 causal、sliding window 模式，不支持 PyTorch FlexAttention 的任意用户函数追踪
-2. **autograd.Function AICore 异常**：通过 `torch.autograd.Function` 调用时可能触发 AICore 异常，直接调用 forward/backward 函数无此问题
-3. **dQ/dK 有 ~10-15% 相对误差**：由 `exp2` 精度限制导致，训练可接受
-4. **大序列性能为 SDPA 的 0.1-0.3x**：原生 SDPA 使用 CANN 硬件级优化内核
-5. **不支持 block-sparse BlockMask**：不支持 PyTorch FlexAttention 的块稀疏索引格式
-6. **反向 block size 固定**：BLOCK_M=16, BLOCK_N=32 固定，更大 block 会触发 910B3 UB 容量溢出
+1. **不支持任意 score_mod/mask_mod**：仅支持预定义的 causal、sliding window、alibi 模式，不支持 PyTorch FlexAttention 的任意用户函数追踪
+2. **大序列性能为 SDPA 的 0.54-0.66x**：原生 SDPA 使用 CANN 硬件级优化内核 (软件流水、TMA 等)，本实现受 triton-ascend 编译器限制无法企及
+3. **DQ 反向 kernel 无法应用 P4 mask 分裂**：triton-ascend 编译器对 DQ 的双循环形式误编译 (产生错误 dQ)，前向/DKDV 同结构正常；DQ 保持单循环
+4. **不支持 block-sparse BlockMask**：不支持 PyTorch FlexAttention 的块稀疏索引格式
+5. **KV 长度需为 BLOCK_N 整数倍**：非整除时 padding 位屏蔽为已知边界待完善项 (当前测试序列均满足)
+
+> **已修复的历史问题**:
+> - dQ/dK ~10-15% 误差 → 全局 Delta 修复后达 fp32 ~1e-7 / fp16 ~2e-4 (§2.3)
+> - autograd.Function 路径此前 backward 未传 `out` (梯度不完整) → 已修正为保存并传递 `out`
+> - 反向 block size 此前硬编码 BLOCK_N=32 → 改为按 Sk 动态 (§2.5)
 
 ## 5. 适用场景
 

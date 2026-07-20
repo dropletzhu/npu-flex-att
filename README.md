@@ -87,7 +87,7 @@ flex-attn/
     ├── test_minimal_flash_attn.py   # 最小 Flash Attention 验证
     ├── test_grad_correctness.py     # 梯度正确性验证
     ├── test_npu_flash_attn.py       # 前向+反向功能测试
-    ├── test_bf16_full.py       # bf16 全量测试 (22 项)
+    ├── test_bf16_full.py       # bf16 全量测试 (38 项)
     ├── test_real_world.py      # 真实场景测试 (12 项)
     ├── bench_flash_attn.py          # 性能基准测试
     ├── bench_block_sweep.py         # Block size 扫描
@@ -119,16 +119,20 @@ flex-attn/
 
 ## 性能概览
 
-| 序列长度 | 前向延迟 | 反向延迟 | SDPA 延迟 | 前向/SDPA |
-|----------|----------|----------|-----------|-----------|
-| S=128 | 0.46ms | 1.40ms | 0.68ms | 1.47x |
-| S=512 | 2.22ms | 4.48ms | 0.68ms | 0.31x |
-| S=1024 | 3.38ms | 7.03ms | 0.93ms | 0.28x |
-| S=2048 | 6.29ms | 15.3ms | 0.76ms | 0.12x |
+优化后 (P0 因果跳过 + P4 mask 分裂 + 全局 Delta 修复 + multibuffer 等) 实测 (fp16 causal, B=1 H=2 D=64):
 
-> S=128 前向超过 SDPA 原生内核速度。大序列的差距来自 CANN `npu_fusion_attention` 的硬件级优化 (TMA、Cube 直接调度等)。
+| 序列长度 | 前向延迟 | 反向延迟 | SDPA 延迟 | 前向/SDPA | 前向 vs 优化前 |
+|----------|----------|----------|-----------|-----------|---------------|
+| S=128 | 0.47ms | 1.26ms | 0.58ms | **1.24x** | 1.47x |
+| S=512 | 1.08ms | 3.02ms | 0.70ms | 0.65x | 1.93x |
+| S=1024 | 1.55ms | 5.05ms | 0.84ms | 0.54x | 2.42x |
+| S=2048 | 2.14ms | 8.99ms | 1.41ms | 0.66x | **4.34x** |
 
-详细测试结果见 [RESULT.md](RESULT.md)。
+> **相比优化前基线**: 前向 1.47x-4.34x、反向 1.20x-2.52x 加速 (序列越长收益越大)。
+> S=128 前向超过 SDPA 原生内核速度。前向 vs SDPA 已从优化前的 0.12-0.31x 提升到 0.54-0.66x。
+> 大序列剩余差距来自 CANN `npu_fusion_attention` 的硬件级优化 (软件流水、Cube 直接调度等)。
+
+详细测试结果与优化历程见 [RESULT.md](RESULT.md) 与 [OPTIMIZATION.md](OPTIMIZATION.md)。
 
 ## 运行测试
 
@@ -139,7 +143,7 @@ source setup_env.sh
 # 全面测试 (38 项, 约 5-10 分钟)
 python test/test_comprehensive.py
 
-# bf16 全量测试 (22 项)
+# bf16 全量测试 (38 项)
 python test/test_bf16_full.py
 
 # 真实场景测试 (12 项)
@@ -155,11 +159,13 @@ python test/test_api_compat.py
 ## 已知限制
 
 1. 不支持 PyTorch FlexAttention 的任意 `score_mod` / `mask_mod` 函数追踪 — 仅支持预定义的 causal、sliding window 模式
-2. `torch.autograd.Function` 集成可能触发 AICore 异常 — 直接调用 forward/backward 函数无此问题
-3. dQ/dK 有 ~10-15% 相对误差 — 由 Triton-Ascend `exp2` 精度限制导致，训练可接受
-4. 大序列性能为 SDPA 的 0.1-0.3x — 原生 SDPA 使用 CANN `npu_fusion_attention` 硬件级内核
-5. 反向 BLOCK_M=16, BLOCK_N=32 固定 — 更大 block 会触发 910B3 UB 容量溢出 (AICore exception)
-6. 不支持 block-sparse BlockMask — 不支持 PyTorch FlexAttention 的块稀疏索引格式
+2. 大序列性能为 SDPA 的 0.54-0.66x — 原生 SDPA 使用 CANN `npu_fusion_attention` 硬件级内核 (软件流水、TMA 等本实现无法企及)
+3. 前向 DQ 反向 kernel 无法应用 P4 mask 分裂 — triton-ascend 编译器对 DQ 双循环形式误编译 (前向/DKDV 同结构正常)，DQ 保持单循环
+4. 不支持 block-sparse BlockMask — 不支持 PyTorch FlexAttention 的块稀疏索引格式
+5. KV 长度需为 BLOCK_N 的整数倍才能保证正确 (当前测试序列均满足)；非整除 KV 长度的 padding 位屏蔽为已知边界待完善项
+
+> **已修复**: 早期版本 dQ/dK 有 ~10-15% 误差 (按块局部 row_sum 近似 softmax 雅可比)，已通过**全局 Delta 修复**
+> 消除，现 fp32 达 ~1e-7、fp16 达 ~2e-4 精度。autograd Function 路径也已修正 (此前 backward 未传 out)。
 
 ## 适用场景
 
