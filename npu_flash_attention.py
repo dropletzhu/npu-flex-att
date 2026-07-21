@@ -1,21 +1,8 @@
-"""NPU Flash Attention — Triton Ascend implementation (L2+ optimized).
-
-Optimizations:
-  P0. Causal diagonal-aware block skipping (forward + DQ + DKDV)
-  P1. DKDV loop-invariant transpose hoisting (kt, vt)
-  P2. Dynamic backward BLOCK_N: 32 for S<=512, 64 for longer
-  P3. DKDV do-to-v dtype cache reuse
-  P4. Causal mask split: unmasked prefix + masked suffix (forward + DKDV)
-  P5. Double-buffer (multibuffer=True) for K/V load latency hiding
-  P6. GQA backward: kernel-internal head mapping (no KV expansion)
-  P7. DQ dynamic BLOCK_N (matches DKDV selection)
-  P8. Backward soft-cap: cached tanh(qk/cap) for ds chain
-  P9. Split-KV forward path for small-sequence grid utilization
-  P10. Dynamic BLOCK_M: 8 for Sq<=128, default for longer
-  L2+ Template Specialization: AttentionConfig + flex_attention API
+"""
+NPU Flash Attention — Triton Ascend implementation
 """
 import torch
-import torch_npu  # noqa: F401
+import torch_npu
 import triton
 import triton.language as tl
 import math
