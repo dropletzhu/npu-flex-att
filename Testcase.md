@@ -9,7 +9,7 @@
 | PyTorch | 2.9.1+cpu |
 | torch_npu | 2.9.1 |
 | triton-ascend | 3.2.0rc4 |
-| Block Size | 前向 BLOCK_M=16, BLOCK_N=64; 反向 BLOCK_M=16, BLOCK_N=32 |
+| Block Size | 前向 BLOCK_M=16, BLOCK_N=64; 反向 BLOCK_M=16, BLOCK_N=32/64 (按 Sk 动态, DQ/DKDV 均使用) |
 
 ## 测试用例
 
@@ -66,15 +66,17 @@
 | D05 | 大 batch | B=8 H=8 S=256 D=64, fp16 | atol=1e-3 |
 | D06 | 小 head_dim D=32 | B=1 H=1 S=128 D=32, fp16 | atol=1e-3 |
 
-### E. 性能测试 (5 组)
+### E. 性能测试 (7 组)
 
 | ID | 测试名称 | 扫描维度 | 指标 |
 |----|----------|----------|------|
-| E01 | 前向延迟扫描 | S ∈ {128,256,512,1024,2048}, D=64, fp16 | ms + TFLOPS |
-| E02 | 前向延迟 D=128 | S ∈ {128,256,512,1024}, D=128, fp16 | ms |
-| E03 | 反向延迟扫描 | S ∈ {128,256,512,1024}, D=64, fp16 | ms |
-| E04 | vs SDPA 速度比 | S×D×dtype 组合, 9 种 | speedup ratio |
-| E07 | Batch scaling | B ∈ {1,2,4,8}, H=4, S=512, fp16 | ms + 利用率 |
+| E00 | 优化前后对比 | S ∈ {128,256,512,1024,2048}, D=64, fp16, causal | ms + vs v2 加速比 + vs SDPA |
+| E01 | 前向延迟扫描 D=64 | S ∈ {128,256,512,1024,2048}, D=64, fp16, causal | ms + vs SDPA |
+| E01b | 前向延迟扫描 D=128 | S ∈ {128,256,512,1024,2048}, D=128, fp16, causal | ms + vs SDPA |
+| E03 | 反向延迟扫描 D=64 | S ∈ {128,256,512,1024,2048}, D=64, fp16, causal | ms + vs SDPA + vs v2 |
+| E03b | 反向延迟 D=128 | S ∈ {128,256,512,1024,2048}, D=128, fp16, causal+non-causal | ms + vs SDPA |
+| E07 | Batch scaling | B ∈ {1,2,4,8}, H ∈ {4,16}, S=512, D=64, fp16 | ms + vs SDPA |
+| E08 | D=128 多场景 | B×H×S 组合, D=128, fp16, causal | ms + vs SDPA |
 
 ### F. 功能完整性 (5 项)
 
@@ -85,6 +87,8 @@
 | F03 | Causal+GQA+fp16 组合 | 多特性组合正确性 |
 | F04 | Sliding+Causal+GQA 组合 | 多特性组合运行无异常 |
 | F05 | 自定义 scale | scale=0.05/0.1/0.2 与参考一致 |
+
+> **注意**: tanh soft-capping 和 ALiBi 功能测试见 `test_supplementary.py` 中的 L2+ 框架 API 验证和 soft-cap 精度测试。
 
 ## 执行方式
 
@@ -101,15 +105,14 @@ python test/test_bf16_full.py
 # 真实场景测试 (12 项)
 python test/test_real_world.py
 
-# 补充测试 (13 项: 跨dtype一致性/输出dtype/内存/训练循环)
+# 补充测试 (13 项: 跨dtype一致性/输出dtype/内存/训练循环/L2+框架/soft-cap)
 python test/test_supplementary.py
 
-# 单独运行性能 benchmark
-python test/bench_flash_attn.py
-python test/bench_block_sweep.py
+# 全面性能 benchmark (7 组场景)
+python test/bench_full_perf.py
 
-# 单独运行 API 兼容性测试
-python test/test_api_compat.py
+# Flex vs SDPA 前向+反向对比 (6 组场景)
+python test/bench_vs_sdpa.py
 ```
 
 ## 测试统计

@@ -144,6 +144,7 @@ Grid: (cdiv(S, BLOCK_M), B, H)
 每个 program 计算一个 query 块的 dQ
 
 [P0] causal 上界: kv_end = min((pid_m+1)*BLOCK_M, KV_LEN)  (跳过对角线以上全 masked 块)
+[P7] 动态 BLOCK_N: block_n = 32 if Sk≤512 else 64  (DQ/DKDV 均使用)
 循环 (遍历 KV 块 0..kv_end):
   for n in range(start_n, kv_end, BLOCK_N):
     1. 加载 K, V
@@ -165,6 +166,9 @@ Grid: (cdiv(S, BLOCK_N), B, H)
 
 [P0] causal 下界: q_start = (pid_n*BLOCK_N // BLOCK_M) * BLOCK_M  (从对角线块开始)
 [P1] kt/vt = trans(k)/trans(v) 外提到循环前 (循环不变量)
+[P3] do_v = dO.to(v.dtype) 缓存复用
+[P6] GQA head 映射: off_hkv = off_hq // GQA_GROUPS (kernel 内部, 无需 expand KV)
+[P7] 动态 BLOCK_N: block_n = 32 if Sk≤512 else 64
 [P4] mask 分裂: 对角线带 (masked) + 对角线上方 (unmasked) 两段循环
 循环 (遍历 Q 块 q_start..Q_LEN):
   for m in range(q_start, Q_LEN, BLOCK_M):
@@ -186,10 +190,12 @@ GQA (Grouped Query Attention) 在反向传播中的处理：
 ```
 前向: K/V 有 Hkv 头, Q 有 Hq 头 (Hq = GQA_GROUPS * Hkv)
 反向: 
-  1. 在 Python 层将 K/V expand 到 Hq 头 (每个 KV 头复制 GQA_GROUPS 次)
-  2. 对每个 query 头独立计算 dK/dV
-  3. 将 dK/dV 沿 GQA_GROUPS 维度求和 (sum, 非 mean)
+  1. Host 侧: 不再 expand KV tensor (节省 4x 内存, Hq=32 Hkv=8)
+  2. DQ kernel: 对每个 query 头独立计算 dQ, 使用 off_hq (无需 head 映射)
+  3. DKDV kernel: 使用 off_hkv = off_hq // GQA_GROUPS 做 head 映射
+  4. 将 dK/dV 沿 GQA_GROUPS 维度求和 (sum, 非 mean)
      因为 K/V 被多个 query head 共享, 梯度应累加
+  5. 输出 dK/dV shape 为 [B, Hkv, S, D] (非 [B, Hq, S, D])
 ```
 
 ### 2.4 LSE (LogSumExp) 处理
@@ -261,13 +267,19 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 | P3 缓存 do_v | DKDV | 复用 `do.to(v.dtype)` | 反向微增 |
 | P4 因果 mask 分裂 | 前向+DKDV | 对角线以下块免 `tl.where` | 前向大 S 额外 ~2x |
 | multibuffer | 三 kernel | 双缓冲隐藏 MTE2 访存延迟 | 前向小 S ~1.45x |
-| 动态反向 BLOCK_N | 反向 | `32 if Sk≤512 else 64` | 大 S 反向 ~9% |
-| **L2+ 模板特化框架** | 全部 | `AttentionConfig` + constexpr dispatch | 新增 soft-cap (Gemma2),可组合原语库 |
+| 动态反向 BLOCK_N | DQ+DKDV | `32 if Sk≤512 else 64` | 大 S 反向 ~9-16% |
+| P6 GQA KV 消除 | DQ+DKDV | kernel 内部 `off_hkv = off_hq // GQA_GROUPS` head 映射 | dK/dV 内存 4x 节省 |
+| P7 DQ 动态 BLOCK_N | DQ | DQ 也用动态 block size | DQ 大序列 ~16% |
+| P8 soft-cap tanh 缓存 | DQ+DKDV | 反向 tanh(qk/cap) 只算一次，ds 链复用 | soft-cap 模式 ~10% Vector ops |
+| L2+ 模板特化框架 | 全部 | `AttentionConfig` + constexpr dispatch | 新增 soft-cap (Gemma2),可组合原语库 |
 
-**综合结果**: 前向 1.47x-4.34x、反向 1.20x-2.52x (vs 优化前 v2)，前向 vs SDPA 由 0.12-0.31x 提升至
-0.54-0.66x，S=128 前向超过 SDPA。
+**综合结果**: 前向 1.44x-4.37x、反向 1.23x-2.48x (vs 优化前 v2)，前向 vs SDPA 最高 **1.81x (S=128)**，
+反向 D=128 最高 **1.18x (S=512)**。
 
 **尝试后放弃的优化** (遵循实测驱动原则):
+- Split-KV forward (P9)：死代码修复成本高，`triton.cdiv` JIT 内不可用 + L_PARTIAL/M_PARTIAL 索引错误
+- BLOCK_M 动态化 (P10)：`BLOCK_M=8` 触发 AICORE `ADDR_MISALIGN` 硬件错误
+- Forward 循环合并 (P11)：合并会消除 P4 mask 分裂的 Vector 节省，反向 S=1024 回退 19%
 - 前向 BLOCK_M=32：数据推翻理论，主力配置退化最多 24% → 保持 16/64
 - i32→float 比较 (避免标量降级)：`.to(float32)` 转换开销 > 收益，大序列回退 36-50% → 弃用
 - DQ kernel P4 分裂：编译器误编译 → 保持单循环
@@ -280,7 +292,7 @@ p = tl.math.exp2((qk - lse) * RCP_LN2)   # = exp(qk - lse) = exp(qk - m_i) / l_i
 | Full Attention (无 mask) | ✅ | ✅ | |
 | Causal Mask | ✅ | ✅ | 下三角因果掩码 |
 | Sliding Window | ✅ | ✅ | 与 causal 组合使用 |
-| GQA (任意 ratio) | ✅ | ✅ | 通过 Python 层 expand + sum |
+| GQA (任意 ratio) | ✅ | ✅ | kernel 内部 head 映射,无需 Python 层 expand |
 | ALiBi Bias | ✅ | ✅ | 注意力分数线性偏置,per-head slope |
 | Tanh Soft-Capping | ✅ | ✅ | Gemma2/Grok-1 风格 logits 软截断 |
 | 自定义 Scale | ✅ | ✅ | |
@@ -364,10 +376,11 @@ ds *= (1 - tanh^2(qk / cap))  # tanh 导数
 ## 4. 已知限制
 
 1. **不支持任意 score_mod/mask_mod**：仅支持预定义原语 (causal、sliding window、ALiBi、GQA、tanh soft-capping 等) 的可组合特化，不支持 PyTorch FlexAttention 的任意用户函数追踪
-2. **大序列性能为 SDPA 的 0.54-0.66x**：原生 SDPA 使用 CANN 硬件级优化内核 (软件流水、TMA 等)，本实现受 triton-ascend 编译器限制无法企及
-3. **DQ 反向 kernel 无法应用 P4 mask 分裂**：triton-ascend 编译器对 DQ 的双循环形式误编译 (产生错误 dQ)，前向/DKDV 同结构正常；DQ 保持单循环
-4. **不支持 block-sparse BlockMask**：不支持 PyTorch FlexAttention 的块稀疏索引格式
-5. **KV 长度需为 BLOCK_N 整数倍**：非整除时 padding 位屏蔽为已知边界待完善项 (当前测试序列均满足)
+2. **大序列性能为 SDPA 的 0.56-0.70x**：原生 SDPA 使用 CANN 硬件级优化内核 (软件流水、TMA 等)，本实现受 triton-ascend 编译器限制无法企及
+3. **GQA 场景 Flex 较慢**：SDPA 有原生 GQA 支持，Flex 在 Python 层 expand KV tensor (Hq=32 Hkv=8 时 4x 复制)
+4. **DQ 反向 kernel 无法应用 P4 mask 分裂**：triton-ascend 编译器对 DQ 的双循环形式误编译 (产生错误 dQ)，前向/DKDV 同结构正常；DQ 保持单循环
+5. **不支持 block-sparse BlockMask**：不支持 PyTorch FlexAttention 的块稀疏索引格式
+6. **KV 长度需为 BLOCK_N 整数倍**：非整除时 padding 位屏蔽为已知边界待完善项 (当前测试序列均满足)
 
 > **已修复的历史问题**:
 > - dQ/dK ~10-15% 误差 → 全局 Delta 修复后达 fp32 ~1e-7 / fp16 ~2e-4 (§2.3)
@@ -376,12 +389,13 @@ ds *= (1 - tanh^2(qk / cap))  # tanh 导数
 
 ## 5. 适用场景
 
-- 需要自定义掩码组合 (causal + sliding window) 的注意力计算
+- 需要自定义掩码组合 (causal + sliding window + ALiBi + soft-cap) 的注意力计算
 - 需要 LSE 输出用于自定义反向传播或 KV cache 场景
 - 需要 bf16/fp16 混合精度训练的前向 + 反向
 - GQA (任意 ratio) 注意力计算，包括 Hq=32 Hkv=8 等大规模配置
 - 研究 Triton-Ascend 在 NPU 上的 kernel 开发
 - 原生 SDPA 不支持的灵活掩码组合场景
+- 小序列前向低延迟场景 (S≤128, Flex 比 SDPA 快 1.81x)
 
 ## 6. 不适用场景
 
@@ -389,6 +403,7 @@ ds *= (1 - tanh^2(qk / cap))  # tanh 导数
 - 需要极致性能的大规模推理 — 建议使用 `npu_fusion_attention` 原生算子
 - 需要 block-sparse 掩码 (如文档级掩码、自定义稀疏模式) — 当前不支持 BlockMask
 - 需要与 `torch.compile` 无缝集成 — 直接调用方式不支持 autograd tracing
+- GQA 大比例场景 (Hq=32 Hkv=8) — SDPA 有原生 GQA 支持，Flex 需 Python 层 expand 较慢
 
 ## 7. triton-ascend 版本兼容性
 

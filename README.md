@@ -115,7 +115,8 @@ flex-attn/
     ├── test_bf16_full.py     # bf16 全量测试 (38 项)
     ├── test_real_world.py    # 真实场景测试 (12 项)
     ├── test_supplementary.py # 补充测试 (13 项)
-    ├── bench_flash_attn.py   # 性能基准测试
+    ├── bench_full_perf.py    # 全面性能测试 (7 组场景)
+    ├── bench_vs_sdpa.py      # Flex vs SDPA 前向+反向对比 (6 组场景)
     └── ...
 ```
 
@@ -147,18 +148,19 @@ flex-attn/
 
 ## 性能概览
 
-优化后 (P0 因果跳过 + P4 mask 分裂 + 全局 Delta 修复 + multibuffer 等) 实测 (fp16 causal, B=1 H=2 D=64):
+优化后 (P0 因果跳过 + P4 mask 分裂 + P6 GQA KV 消除 + P7 DQ动态BLOCK_N + multibuffer 等) 实测 (fp16 causal, B=1 H=2 D=64):
 
 | 序列长度 | 前向延迟 | 反向延迟 | SDPA 延迟 | 前向/SDPA | 前向 vs 优化前 |
 |----------|----------|----------|-----------|-----------|---------------|
-| S=128 | 0.47ms | 1.26ms | 0.58ms | **1.24x** | 1.47x |
-| S=512 | 1.08ms | 3.02ms | 0.70ms | 0.65x | 1.93x |
-| S=1024 | 1.55ms | 5.05ms | 0.84ms | 0.54x | 2.42x |
-| S=2048 | 2.14ms | 8.99ms | 1.41ms | 0.66x | **4.34x** |
+| S=128 | **0.33ms** | 1.37ms | 0.59ms | **1.81x (Flex 快)** | 2.13x |
+| S=512 | 0.98ms | 3.27ms | 0.92ms | 0.94x (接近) | 2.13x |
+| S=1024 | 1.55ms | 4.24ms | 1.08ms | 0.70x | 2.42x |
+| S=2048 | 2.26ms | 9.27ms | 1.26ms | 0.56x | **4.10x** |
 
-> **相比优化前基线**: 前向 1.47x-4.34x、反向 1.20x-2.52x 加速 (序列越长收益越大)。
-> S=128 前向超过 SDPA 原生内核速度。前向 vs SDPA 已从优化前的 0.12-0.31x 提升到 0.54-0.66x。
-> 大序列剩余差距来自 CANN `npu_fusion_attention` 的硬件级优化 (软件流水、Cube 直接调度等)。
+> **相比优化前基线**: 前向 1.44x-4.37x、反向 1.23x-2.48x 加速。
+> **S=128 前向比 SDPA 快 81%**，S=512 接近持平；大序列 SDPA CANN 硬件级优化占主导。
+> Flex 反向在 D=128 S=512 场景**快于 SDPA 18%**（无 autograd 图开销）。
+> Flex 独特价值：支持 causal+sliding+ALiBi+soft-cap 组合、非标准 GQA 比例、自定义 LSE 输出。
 
 详细测试结果与优化历程见 [RESULT.md](RESULT.md)。
 
@@ -180,17 +182,21 @@ python test/test_real_world.py
 # 补充测试 (13 项)
 python test/test_supplementary.py
 
-# 性能 benchmark
-python test/bench_flash_attn.py
+# 全面性能 benchmark (7 组场景)
+python test/bench_full_perf.py
+
+# Flex vs SDPA 前向+反向对比 (6 组场景)
+python test/bench_vs_sdpa.py
 ```
 
 ## 已知限制
 
 1. 不支持 PyTorch FlexAttention 的任意 `score_mod` / `mask_mod` 函数追踪 — 仅支持预定义原语 (causal、sliding window、ALiBi、GQA、tanh soft-capping 等) 的可组合特化
-2. 大序列性能为 SDPA 的 0.54-0.66x — 原生 SDPA 使用 CANN `npu_fusion_attention` 硬件级内核 (软件流水、TMA 等本实现无法企及)
-3. 前向 DQ 反向 kernel 无法应用 P4 mask 分裂 — triton-ascend 编译器对 DQ 双循环形式误编译 (前向/DKDV 同结构正常)，DQ 保持单循环
-4. 不支持 block-sparse BlockMask — 不支持 PyTorch FlexAttention 的块稀疏索引格式
-5. KV 长度需为 BLOCK_N 的整数倍才能保证正确 (当前测试序列均满足)；非整除 KV 长度的 padding 位屏蔽为已知边界待完善项
+2. 大序列性能为 SDPA 的 0.56-0.70x — 原生 SDPA 使用 CANN `npu_fusion_attention` 硬件级内核 (软件流水、TMA 等)
+3. GQA 场景 Flex 较慢 — SDPA 有原生 GQA 支持，Flex 在 Python 层 expand KV (Hq=32 Hkv=8 时 4x 复制)
+4. 前向 DQ 反向 kernel 无法应用 P4 mask 分裂 — triton-ascend 编译器对 DQ 双循环形式误编译 (前向/DKDV 同结构正常)，DQ 保持单循环
+5. 不支持 block-sparse BlockMask — 不支持 PyTorch FlexAttention 的块稀疏索引格式
+6. KV 长度需为 BLOCK_N 的整数倍才能保证正确 (当前测试序列均满足)；非整除 KV 长度的 padding 位屏蔽为已知边界待完善项
 
 > **已修复**: 早期版本 dQ/dK 有 ~10-15% 误差 (按块局部 row_sum 近似 softmax 雅可比)，已通过**全局 Delta 修复**
 > 消除，现 fp32 达 ~1e-7、fp16 达 ~2e-4 精度。autograd Function 路径也已修正 (此前 backward 未传 out)。
@@ -203,7 +209,8 @@ python test/bench_flash_attn.py
 - 需要 LSE 输出用于自定义反向传播或 KV cache 场景
 - 需要 bf16/fp16 混合精度训练的前向 + 反向
 - 研究 Triton-Ascend 在 NPU 上的 kernel 开发
-- 原生 SDPA 不支持的 GQA ratio (如 32:8) 场景
+- 非标准 GQA ratio (如 32:8) 场景，SDPA 不直接支持
+- 小序列前向低延迟场景 (S≤128, Flex 比 SDPA 快 81%)
 
 ## 不适用场景
 
@@ -211,6 +218,7 @@ python test/bench_flash_attn.py
 - 需要极致性能的大规模推理 — 建议使用 `npu_fusion_attention` 原生算子
 - 需要 block-sparse 掩码 (如文档级掩码、自定义稀疏模式) — 当前不支持 BlockMask
 - 需要与 `torch.compile` 无缝集成的场景 — 直接调用方式不支持 autograd tracing
+- GQA 大比例场景 (Hq=32 Hkv=8) — SDPA 有原生 GQA 支持，Flex 需 Python 层 expand 较慢
 
 ## triton-ascend 版本现状与展望
 

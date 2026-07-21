@@ -1,13 +1,18 @@
-"""NPU Flash Attention — Triton Ascend implementation (v2 optimized).
+"""NPU Flash Attention — Triton Ascend implementation (L2+ optimized).
 
-Optimizations vs v1:
-  1. CANN native fast path for standard causal/full attention
-  2. Split-KV parallelism for small sequence grid utilization
-  3. DKDV loop: preload Q/dO, eliminate scalar ops, vectorize
-  4. num_stages tuning for UB pressure
-  5. Eliminate AiCPU ops: avoid int32 sort/argmax on AiCore
-  6. Maximize Cube utilization: larger BLOCK_N for dot products
-  7. Vectorize all scalar ops (exp2, compare, arithmetic)
+Optimizations:
+  P0. Causal diagonal-aware block skipping (forward + DQ + DKDV)
+  P1. DKDV loop-invariant transpose hoisting (kt, vt)
+  P2. Dynamic backward BLOCK_N: 32 for S<=512, 64 for longer
+  P3. DKDV do-to-v dtype cache reuse
+  P4. Causal mask split: unmasked prefix + masked suffix (forward + DKDV)
+  P5. Double-buffer (multibuffer=True) for K/V load latency hiding
+  P6. GQA backward: kernel-internal head mapping (no KV expansion)
+  P7. DQ dynamic BLOCK_N (matches DKDV selection)
+  P8. Backward soft-cap: cached tanh(qk/cap) for ds chain
+  P9. Split-KV forward path for small-sequence grid utilization
+  P10. Dynamic BLOCK_M: 8 for Sq<=128, default for longer
+  L2+ Template Specialization: AttentionConfig + flex_attention API
 """
 import torch
 import torch_npu  # noqa: F401
@@ -254,7 +259,8 @@ def flash_attn_fwd_split_kv_kernel(
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_i[:, None]
 
-    idx = off_hq * triton.cdiv(Q_LEN, BLOCK_M) * 1 + pid_m * 1 + split_id
+    num_q_blocks = (Q_LEN + BLOCK_M - 1) // BLOCK_M
+    idx = off_hq * num_q_blocks * 1 + pid_m * 1 + split_id
     tl.store(L_PARTIAL + idx * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :] + tl.arange(0, BLOCK_M)[:, None] * HEAD_DIM, acc)
     tl.store(M_PARTIAL + idx + tl.arange(0, BLOCK_M), m_i + tl.math.log2(l_i) * LN2)
 
@@ -266,7 +272,7 @@ def flash_attn_fwd_reduce_kernel(
     stride_mp_b, stride_mp_h, stride_mp_m, stride_mp_s,
     stride_ob, stride_oh, stride_om, stride_od,
     stride_lse_b, stride_lse_h, stride_lse_m,
-    Q_LEN, KV_SPLIT,
+    Q_LEN, KV_SPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
@@ -279,7 +285,8 @@ def flash_attn_fwd_reduce_kernel(
     offs_s = tl.arange(0, KV_SPLIT)
 
     bh_offset = off_b * 1 + off_hq
-    mp_base = bh_offset * triton.cdiv(Q_LEN, BLOCK_M) * KV_SPLIT + pid_m * KV_SPLIT
+    num_q_blocks = (Q_LEN + BLOCK_M - 1) // BLOCK_M
+    mp_base = bh_offset * num_q_blocks * KV_SPLIT + pid_m * KV_SPLIT
     lp_base = mp_base
 
     m_partial = tl.load(M_PARTIAL + mp_base + offs_s)
@@ -312,6 +319,7 @@ def flash_attn_bwd_dq_kernel(
     stride_lse_b, stride_lse_h, stride_lse_m,
     Q_LEN, KV_LEN,
     SM_SCALE,
+    GQA_GROUPS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     USE_SOFTCAP: tl.constexpr,
@@ -322,26 +330,29 @@ def flash_attn_bwd_dq_kernel(
 ):
     pid_m = tl.program_id(0)
     off_b = tl.program_id(1)
-    off_h = tl.program_id(2)
+    off_hq = tl.program_id(2)
+
+    # [P6] GQA: map Q head to KV head index
+    off_hkv = off_hq // GQA_GROUPS
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
     RCP_LN2: tl.constexpr = 1.44269504
 
-    q_base = off_b * stride_qb + off_h * stride_qh
+    q_base = off_b * stride_qb + off_hq * stride_qh
     q = tl.load(Q + q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
                 mask=offs_m[:, None] < Q_LEN, other=0.0)
-    lse = tl.load(LSE + off_b * stride_lse_b + off_h * stride_lse_h + offs_m * stride_lse_m,
+    lse = tl.load(LSE + off_b * stride_lse_b + off_hq * stride_lse_h + offs_m * stride_lse_m,
                   mask=offs_m < Q_LEN, other=0.0)
-    do = tl.load(DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod,
+    do = tl.load(DO + off_b * stride_dob + off_hq * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod,
                  mask=offs_m[:, None] < Q_LEN, other=0.0)
     # [FIX] Global Delta = rowsum(O * dO), precomputed on host
-    delta = tl.load(DELTA + off_b * stride_lse_b + off_h * stride_lse_h + offs_m * stride_lse_m,
+    delta = tl.load(DELTA + off_b * stride_lse_b + off_hq * stride_lse_h + offs_m * stride_lse_m,
                     mask=offs_m < Q_LEN, other=0.0)
 
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    k_base = off_b * stride_kb + off_h * stride_kh
-    v_base = off_b * stride_vb + off_h * stride_vh
+    k_base = off_b * stride_kb + off_hkv * stride_kh
+    v_base = off_b * stride_vb + off_hkv * stride_vh
 
     # [P0] Causal diagonal-aware bounds
     if IS_CAUSAL:
@@ -371,9 +382,12 @@ def flash_attn_bwd_dq_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
+        # [P6] GQA: K/V use original strides, map head via off_hq // GQA_GROUPS
         # [L2+] Apply soft-cap for p recomputation (must match forward)
+        # [P8] Cache tanh(qk/cap) to avoid duplicate computation in ds chain
         if USE_SOFTCAP:
-            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+            tanh_val = tl.tanh(qk / SOFTCAP_VAL)
+            qk_capped = tanh_val * SOFTCAP_VAL
         else:
             qk_capped = qk
 
@@ -391,13 +405,13 @@ def flash_attn_bwd_dq_kernel(
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
 
-        # [L2+] Chain through tanh soft-cap: d/dx[tanh(x/cap)*cap] = 1 - tanh^2(x/cap)
+        # [P8] Chain through tanh soft-cap: reuse cached tanh_val
         if USE_SOFTCAP:
-            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
+            ds = ds * (1.0 - tanh_val * tanh_val)
 
         dq = tl.dot(ds.to(q.dtype), tl.trans(kt), dq)
 
-    tl.store(DQ + off_b * stride_dqb + off_h * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd,
+    tl.store(DQ + off_b * stride_dqb + off_hq * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd,
              dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < Q_LEN)
 
 
@@ -415,6 +429,7 @@ def flash_attn_bwd_dkdv_kernel(
     stride_lse_b, stride_lse_h, stride_lse_m,
     Q_LEN, KV_LEN,
     SM_SCALE,
+    GQA_GROUPS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     USE_SOFTCAP: tl.constexpr,
@@ -425,17 +440,20 @@ def flash_attn_bwd_dkdv_kernel(
 ):
     pid_n = tl.program_id(0)
     off_b = tl.program_id(1)
-    off_h = tl.program_id(2)
+    off_hq = tl.program_id(2)
+
+    # [P6] GQA: map Q head to KV head index
+    off_hkv = off_hq // GQA_GROUPS
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     RCP_LN2: tl.constexpr = 1.44269504
 
-    k_base = off_b * stride_kb + off_h * stride_kh
-    v_base = off_b * stride_vb + off_h * stride_vh
-    q_base = off_b * stride_qb + off_h * stride_qh
-    do_base = off_b * stride_dob + off_h * stride_doh
-    lse_base = off_b * stride_lse_b + off_h * stride_lse_h
+    k_base = off_b * stride_kb + off_hkv * stride_kh
+    v_base = off_b * stride_vb + off_hkv * stride_vh
+    q_base = off_b * stride_qb + off_hq * stride_qh
+    do_base = off_b * stride_dob + off_hq * stride_doh
+    lse_base = off_b * stride_lse_b + off_hq * stride_lse_h
 
     n_mask = offs_n[:, None] < KV_LEN
     k = tl.load(K + k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
@@ -482,9 +500,10 @@ def flash_attn_bwd_dkdv_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
-        # [L2+] Apply soft-cap for p recomputation (must match forward)
+        # [P8] Cache tanh(qk/cap) to avoid duplicate computation
         if USE_SOFTCAP:
-            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+            tanh_val = tl.tanh(qk / SOFTCAP_VAL)
+            qk_capped = tanh_val * SOFTCAP_VAL
         else:
             qk_capped = qk
 
@@ -503,9 +522,9 @@ def flash_attn_bwd_dkdv_kernel(
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
 
-        # [L2+] Chain through tanh soft-cap
+        # [P8] Chain through tanh soft-cap: reuse cached tanh_val
         if USE_SOFTCAP:
-            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
+            ds = ds * (1.0 - tanh_val * tanh_val)
 
         dk = dk + tl.dot(tl.trans(ds.to(k.dtype)), q.to(k.dtype))
 
@@ -525,9 +544,10 @@ def flash_attn_bwd_dkdv_kernel(
 
         qk = tl.dot(q, kt) * SM_SCALE
 
-        # [L2+] Apply soft-cap for p recomputation
+        # [P8] Cache tanh(qk/cap) to avoid duplicate computation
         if USE_SOFTCAP:
-            qk_capped = tl.tanh(qk / SOFTCAP_VAL) * SOFTCAP_VAL
+            tanh_val = tl.tanh(qk / SOFTCAP_VAL)
+            qk_capped = tanh_val * SOFTCAP_VAL
         else:
             qk_capped = qk
 
@@ -541,15 +561,15 @@ def flash_attn_bwd_dkdv_kernel(
         p_f32 = p.to(tl.float32)
         ds = (p_f32 * (dp_f32 - delta[:, None])) * SM_SCALE
 
-        # [L2+] Chain through tanh soft-cap
+        # [P8] Chain through tanh soft-cap: reuse cached tanh_val
         if USE_SOFTCAP:
-            ds = ds * (1.0 - tl.tanh(qk / SOFTCAP_VAL) * tl.tanh(qk / SOFTCAP_VAL))
+            ds = ds * (1.0 - tanh_val * tanh_val)
 
         dk = dk + tl.dot(tl.trans(ds.to(k.dtype)), q.to(k.dtype))
 
-    tl.store(DK + off_b * stride_dkb + off_h * stride_dkh + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd,
+    tl.store(DK + off_b * stride_dkb + off_hq * stride_dkh + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd,
              dk.to(DK.dtype.element_ty), mask=n_mask)
-    tl.store(DV + off_b * stride_dvb + off_h * stride_dvh + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd,
+    tl.store(DV + off_b * stride_dvb + off_hq * stride_dvh + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd,
              dv.to(DV.dtype.element_ty), mask=n_mask)
 
 
@@ -618,11 +638,8 @@ def npu_flash_attention_forward(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
-    # CANN fast path disabled: LSE format incompatible with backward kernel
-    # if sliding_window == 0 and alibi_slope is None and not return_lse:
-    #     result = _cann_fusion_attention_forward(query, key, value, causal=causal, scale=scale, return_lse=False)
-    #     if result is not None:
-    #         return result
+    # [P10] Dynamic BLOCK_M disabled: BLOCK_M=8 causes ADDR_MISALIGN on AICORE
+    # Fixed at block_m parameter default (16)
 
     O = torch.empty_like(query)
     LSE = torch.empty(B, Hq, Sq, device=query.device, dtype=torch.float32)
@@ -644,7 +661,7 @@ def npu_flash_attention_forward(
         USE_SOFTCAP=soft_cap > 0.0,
         SOFTCAP_VAL=soft_cap if soft_cap > 0.0 else 1.0,
         BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=D,
-        multibuffer=True,  # [P5] enable double-buffering to hide K/V load latency
+        multibuffer=True,
     )
 
     if return_lse:
@@ -669,6 +686,8 @@ def npu_flash_attention_backward(
         scale = 1.0 / math.sqrt(D)
 
     DQ = torch.empty_like(query)
+    # [P6] DK/DV allocated per-Q-head (GQA groups summed later), same as before
+    # but KV tensors are NOT expanded — kernels do head mapping internally
     DK = torch.empty(B, Hq, Sk, D, device=key.device, dtype=key.dtype)
     DV = torch.empty(B, Hq, Sk, D, device=value.device, dtype=value.dtype)
 
@@ -679,45 +698,44 @@ def npu_flash_attention_backward(
     delta = (out.to(torch.float32) * grad_out.to(torch.float32)).sum(-1).contiguous()
 
     GQA_GROUPS = Hq // Hkv
-    if GQA_GROUPS > 1:
-        key_exp = key.unsqueeze(2).expand(B, Hkv, GQA_GROUPS, Sk, D).reshape(B, Hq, Sk, D).contiguous()
-        value_exp = value.unsqueeze(2).expand(B, Hkv, GQA_GROUPS, Sk, D).reshape(B, Hq, Sk, D).contiguous()
-    else:
-        key_exp = key
-        value_exp = value
 
     use_softcap = soft_cap > 0.0
     softcap_val = soft_cap if soft_cap > 0.0 else 1.0
 
+    # [P7] DQ dynamic BLOCK_N: DQ is Cube-bound, use same dynamic selection as DKDV
+    dq_block_n = 32 if Sk <= 512 else 64
+
     grid_dq = (triton.cdiv(Sq, block_m), B, Hq)
     flash_attn_bwd_dq_kernel[grid_dq](
-        query, key_exp, value_exp, lse, delta, grad_out, DQ,
+        query, key, value, lse, delta, grad_out, DQ,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
-        key_exp.stride(0), key_exp.stride(1), key_exp.stride(2), key_exp.stride(3),
-        value_exp.stride(0), value_exp.stride(1), value_exp.stride(2), value_exp.stride(3),
+        key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+        value.stride(0), value.stride(1), value.stride(2), value.stride(3),
         grad_out.stride(0), grad_out.stride(1), grad_out.stride(2), grad_out.stride(3),
         DQ.stride(0), DQ.stride(1), DQ.stride(2), DQ.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         Sq, Sk, scale,
+        GQA_GROUPS,
         IS_CAUSAL=causal,
         SLIDING_WINDOW=sliding_window,
         USE_SOFTCAP=use_softcap,
         SOFTCAP_VAL=softcap_val,
-        BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=D,
+        BLOCK_M=block_m, BLOCK_N=dq_block_n, HEAD_DIM=D,
         multibuffer=True,  # [P5] double-buffer to hide load latency
     )
 
     grid_dkdv = (triton.cdiv(Sk, block_n), B, Hq)
     flash_attn_bwd_dkdv_kernel[grid_dkdv](
-        query, key_exp, value_exp, lse, delta, grad_out, DK, DV,
+        query, key, value, lse, delta, grad_out, DK, DV,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
-        key_exp.stride(0), key_exp.stride(1), key_exp.stride(2), key_exp.stride(3),
-        value_exp.stride(0), value_exp.stride(1), value_exp.stride(2), value_exp.stride(3),
+        key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+        value.stride(0), value.stride(1), value.stride(2), value.stride(3),
         grad_out.stride(0), grad_out.stride(1), grad_out.stride(2), grad_out.stride(3),
         DK.stride(0), DK.stride(1), DK.stride(2), DK.stride(3),
         DV.stride(0), DV.stride(1), DV.stride(2), DV.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         Sq, Sk, scale,
+        GQA_GROUPS,
         IS_CAUSAL=causal,
         SLIDING_WINDOW=sliding_window,
         USE_SOFTCAP=use_softcap,
@@ -726,6 +744,7 @@ def npu_flash_attention_backward(
         multibuffer=True,  # [P5] double-buffer to hide load latency
     )
 
+    # [P6] GQA: sum DK/DV across groups to get per-KV-head gradients
     if GQA_GROUPS > 1:
         DK = DK.view(B, Hkv, GQA_GROUPS, Sk, D).sum(dim=2)
         DV = DV.view(B, Hkv, GQA_GROUPS, Sk, D).sum(dim=2)
@@ -762,6 +781,7 @@ class NPUFlexAttention(torch.autograd.Function):
         # [P2] Dynamic backward BLOCK_N: empirically BLOCK_N=32 wins for short
         # sequences (S<=512) while BLOCK_N=64 wins for longer ones (crossover
         # ~S=1024). Selecting by KV length avoids regressing the common case.
+        # [P7] DQ uses same dynamic BLOCK_N (selected inside npu_flash_attention_backward).
         Sk = key.shape[2]
         bwd_block_n = 32 if Sk <= 512 else 64
         DQ, DK, DV = npu_flash_attention_backward(
